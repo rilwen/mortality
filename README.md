@@ -5,4 +5,6 @@ The model uses a Recurrent Neural Network to extrapolate forward in time a seque
 (e.g. age group for mortality rates). The code is self-contained and requires only standard Python numerical libraries (Pandas, Numpy) and
 TensorFlow.
 
+Download the directory "sources" if you want to apply the model to mortality rates.
+
 Licensed under GPL v3.
