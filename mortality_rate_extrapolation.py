@@ -169,7 +169,7 @@ def train_and_test(country, sex, num_layers=2, clip_gradient=False, do_extrapola
 		do_extrapolation: Whether to do extrapolation or test
 		pretrained_values: Dictionary mapping variable names to their pretrained values
 		restore: Whether to load the trained model from disk.
-		do_gradients: Whether to save gradients of outputs over inputs (slow).
+		do_gradients: Whether to save gradients of outputs over inputs.
 	"""
 	basename = "%s-%s-mortality-period-qx.csv" % (country, sex)
 	years, ages, mortality_rates = load_data(os.path.join("sources", basename))
