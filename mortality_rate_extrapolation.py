@@ -16,11 +16,9 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
-import itertools
 import logging
-logging.basicConfig(filename='extrapolation.log',level=logging.INFO)
-#logging.basicConfig(level=logging.INFO)
 import os
+import sys
 
 import numpy as np
 import pandas as pd
@@ -38,8 +36,17 @@ MAX_EXTRAPOLATION_YEAR_GRAD = 2100
 # Ages for which we need the gradients of extrapolated rates.
 AGES_GRAD = [0, 5, 10, 15, 20, 30, 45, 60, 65, 75, 85, 90, 100]
 
-RESULTS = "results"
-CHECKPOINTS = "checkpoints"
+# Maximum year for historical data.
+MAX_YEAR_HIST = 2016
+
+# Where to save results
+RESULTS_BASE = "results%d" % MAX_YEAR_HIST
+
+# Where to save TensorFlow checkpoints
+CHECKPOINTS_BASE = "checkpoints%d" % MAX_YEAR_HIST
+
+# How many extrapolations during training
+N_TRAIN = 10
 
 
 def load_data(path):
@@ -124,86 +131,100 @@ def get_cell_neural_network_builder(*args, **kwargs):
 	return lambda inputs: build_cell_neural_network(inputs, *args, **kwargs)
 	
 	
-def apply_cell_with_targets(cell_builder, total_sequence, input_size):
+def apply_cell(cell_builder, total_sequence, input_size=None, output_size=None):
 	batch_size, sequence_length = total_sequence.shape
-	output_size = sequence_length - input_size
+	if input_size is None:
+		input_size = sequence_length
+	if output_size is None:
+		output_size = sequence_length - input_size
 	outputs = []
-	targets = []
 	input = total_sequence[:, :input_size]
 	for i in range(output_size):
 		output = cell_builder(input)
 		assert output.shape[1] == 1, output
-		j = input_size + i
-		assert j < sequence_length
-		assert j >= 0
-		target = total_sequence[:, j:(j+1)]
-		assert target.shape[1] == 1, target
 		outputs.append(output)
-		targets.append(target)
 		input = tf.concat([input[:, 1:], output], axis=1)
 	assert len(outputs) == output_size
-	assert len(targets) == output_size
 	output = tf.concat(outputs, axis=1)
-	target = tf.concat(targets, axis=1)
-	return output, target
+	return output
+
 	
+def split_indices_into_ABC(n, k):
+	"""Split indices 0, ..., n-1 into sets A containing k-2/k of them and B and C containg 1/k of them each.
+	Set A contains index 0.
+	"""
+	assert k > 2
+	B = list(range(1, n, k))
+	C = list(range(2, n, k))
+	not_A = B + C
+	A = [i for i in range(n) if i not in not_A]
+	return A, B, C
 
-def apply_cell(cell_builder, input, output_size):
-	batch_size, input_size = input.shape
-	outputs = []
-	for i in range(output_size):
-		output = cell_builder(input)
-		assert output.shape[1] == 1, output
-		outputs.append(output)
-		input = tf.concat([input[:, 1:], output], axis=1)
-	assert len(outputs) == output_size
-	return tf.concat(outputs, axis=1)
 
-
-def train_and_test(country, sex, num_layers=2, clip_gradient=False, do_extrapolation=False, pretrained_values=None, restore=False, do_gradients=False):
+def run(mode, run_idx, country, sex, input_size=40, num_layers=4, hidden_size=128, clip_gradient=False, restore=False, do_gradients=True, save_checkpoints=False):
 	"""Args:
+		mode: "train", "test" or "apply". Data are divided into sets A (60%), B (20%) and C(20%).
+		run_idx: Index of the run (for CI calculations).
 		country: "uk", "ew", ...
 		sex: "male" or "female"
+		input_size: Size of the input window.
 		num_layers: Number of NN layers excluding the input layer
 		clip_gradient: Whether to clip gradient values for stochastic gradient (helps to avoid blow-up)
 		do_extrapolation: Whether to do extrapolation or test
-		pretrained_values: Dictionary mapping variable names to their pretrained values
 		restore: Whether to load the trained model from disk.
 		do_gradients: Whether to save gradients of outputs over inputs.
+		save_checkpoints: Whether to save checkpoints with the model.
 	"""
-	basename = "%s-%s-mortality-period-qx.csv" % (country, sex)
+	basename = "%s-%s-mortality-period-qx-%d.csv" % (country, sex, MAX_YEAR_HIST)
 	years, ages, mortality_rates = load_data(os.path.join("sources", basename))
 	logging.debug("Years == %s", years)
 	logging.debug("Ages == %s", ages)
 	num_ages = len(ages)
+	num_years = len(years)
 	assert num_ages == mortality_rates.shape[0]
-	assert len(years) == mortality_rates.shape[1]
+	assert num_years == mortality_rates.shape[1]
 	max_input_year = max(years)
+	
+	results_dir = os.path.join(RESULTS_BASE, "%s_IS=%d" % (mode, input_size), str(run_idx))
+	checkpoints_dir = os.path.join(CHECKPOINTS_BASE, "%s_IS=%d" % (mode, input_size), str(run_idx))
+	for directory in [results_dir, checkpoints_dir]:
+		ensure_dir(os.path.join(".", directory))
 	
 	# Reset calculation graph
 	tf.reset_default_graph()
 	
 	weights_stdev = 1e-1
-	input_size = 25
-	train_target_size = 10
-	train_sequence_length = input_size + train_target_size
-	hidden_size = 128
+	train_target_size = N_TRAIN
+	train_sequence_length = input_size + train_target_size	
 	
 	cell_nn_builder = get_cell_neural_network_builder(num_layers, hidden_size, 1, scope_name="qx_%s_%s" % (country, sex), weights_stdev=weights_stdev)
 	
 	logging.info("\n******\nCountry == %s, Sex == %s, Hidden Size == %d, Input Size == %d, Number Layers == %d\n******", country, sex, hidden_size, input_size, num_layers)
+	logging.info("Saving in directories %s and %s", results_dir, checkpoints_dir)
+	
+	do_extrapolation = mode == "apply"
 	
 	if do_extrapolation:
 		train_indices = list(range(num_ages))
+		test_indices = []
 	else:
-		train_test_ratio = 5 # Must be an int.
-		test_indices = list(range(1, num_ages, train_test_ratio))
-		train_indices = [i for i in range(num_ages) if i not in test_indices]
-		test_sequence = create_sequence_queue(mortality_rates[test_indices], len(years), batch_size=None, shuffle=False)
-		test_output, test_target = apply_cell_with_targets(cell_nn_builder, test_sequence, input_size)		
+		A, B, C = split_indices_into_ABC(num_ages, 5)
+		if mode == "test":
+			train_indices = A + B
+			test_indices = C
+		else:
+			assert mode == "train", mode
+			train_indices = A
+			test_indices = B
+	
+	if test_indices:
+		test_sequence = create_sequence_queue(mortality_rates[test_indices], num_years, batch_size=None, shuffle=False)
+		test_output = apply_cell(cell_nn_builder, test_sequence, input_size=input_size)
+		test_target = test_sequence[:, input_size:]
 	
 	train_sequence = create_sequence_queue(mortality_rates[train_indices], train_sequence_length, batch_size=16)
-	train_output, train_target = apply_cell_with_targets(cell_nn_builder, train_sequence, input_size)
+	train_output = apply_cell(cell_nn_builder, train_sequence, input_size=input_size)
+	train_target = train_sequence[:, input_size:]
 	
 	# After we have created the graph
 	trainable_variables = tf.trainable_variables()
@@ -213,7 +234,7 @@ def train_and_test(country, sex, num_layers=2, clip_gradient=False, do_extrapola
 		# Do it age-group-by-age-group to speed up calculation of gradients.
 		extrap_input = tf.constant(mortality_rates[:, -input_size:])
 		num_extrapolated_years = MAX_EXTRAPOLATION_YEAR - max_input_year
-		extrap_output = apply_cell(cell_nn_builder, extrap_input, num_extrapolated_years)
+		extrap_output = apply_cell(cell_nn_builder, extrap_input, output_size=num_extrapolated_years)
 		assert extrap_output.shape == (num_ages, num_extrapolated_years), extrap_output
 		if do_gradients:
 			gradient_mask = tf.placeholder(tf.float64, shape=extrap_output.shape)
@@ -228,20 +249,10 @@ def train_and_test(country, sex, num_layers=2, clip_gradient=False, do_extrapola
 		test_loss = tf.reduce_mean(tf.pow(test_residuals, 2))
 		test_bias = tf.reduce_mean(test_residuals)
 	
-	# logging.info("Trainable variables: %s", tf.trainable_variables())
-	initialisation_ops = []
-	if pretrained_values:
-		for variable in tf.trainable_variables():
-			if variable.name in pretrained_values:
-				init_value = pretrained_values[variable.name]
-				if init_value.shape == variable.shape:
-					initialisation_ops.append(tf.assign(variable, init_value))
-	logging.info("Have %d pretrained initialisation values", len(initialisation_ops))
-	
 	# learning rate for RMSProp must be small (it scales it up internally)
 	# Graph operations to decrease the learning rate if required
-	if do_extrapolation:
-		n_steps = 0 if restore else 200001
+	if mode in ("apply", "test"):
+		n_steps = 0 if restore else 270001
 	else:
 		n_steps = 300001
 	if n_steps:
@@ -262,22 +273,28 @@ def train_and_test(country, sex, num_layers=2, clip_gradient=False, do_extrapola
 			opt_step = opt.minimize(train_loss)
 	
 	step_delta = min(int(n_steps / 10), 10000)
-	model_filename = os.path.join(CHECKPOINTS, "M2_%s_%s_NL%d_HS%d_IS%d.ckpt" % (country, sex, num_layers, hidden_size, input_size))
-	saver = tf.train.Saver()
+	model_filename = os.path.join(checkpoints_dir, "M2_%s_%s_NL%d_HS%d_IS%d.ckpt" % (country, sex, num_layers, hidden_size, input_size))
+	if save_checkpoints or restore:
+		saver = tf.train.Saver()
 	
-	init = tf.global_variables_initializer()		
+	init = tf.global_variables_initializer()
+
+	## To allow two processes at the same time.
+	#config = tf.ConfigProto()
+	#config.gpu_options.allow_growth = True
+	#config.gpu_options.per_process_gpu_memory_fraction = 0.4
 	
+	#with tf.Session(config=config) as sess:
 	with tf.Session() as sess:
 		if restore:
 			saver.restore(sess, model_filename)
 			logging.info("Model restored.")
 		else:
 			sess.run(init)
-		if initialisation_ops:
-			sess.run(initialisation_ops)
 		previous_loss = np.inf
 		lowest_test_loss = np.inf
 		lowest_test_loss_step = -1
+		lowest_test_bias = np.inf
 		for i in range(n_steps):
 			_, current_loss = sess.run([opt_step, train_loss])
 			if np.isnan(current_loss):
@@ -289,17 +306,18 @@ def train_and_test(country, sex, num_layers=2, clip_gradient=False, do_extrapola
 					new_learning_rate = np.exp(sess.run(decrease_learning_rate))
 					logging.info("Decreasing learning rate from %g to %g", current_learning_rate, new_learning_rate)
 				previous_loss = current_loss		
-				if do_extrapolation:
-					logging.info("Step %d: train loss == %g", i, current_loss)
-					save_path = saver.save(sess, model_filename)
-					logging.info("Model saved in path: %s" % save_path)
-				else:
+				logging.info("Step %d: train loss == %g", i, current_loss)
+				if mode == "train":
 					test_loss_value, test_bias_value = sess.run([test_loss, test_bias])
-					logging.info("Step %d: train loss == %g, test loss == %g, test bias == %g", i, current_loss, test_loss_value, test_bias_value)
+					logging.info("Step %d: test loss == %g, test bias == %g", i, test_loss_value, test_bias_value)
 					if test_loss_value < lowest_test_loss:
 						lowest_test_loss = test_loss_value
+						lowest_test_bias = test_bias_value
 						lowest_test_loss_step = i
-		if do_extrapolation:
+		if save_checkpoints:
+			save_path = saver.save(sess, model_filename)
+			logging.info("Model saved in path: %s" % save_path)
+		if mode == "apply":
 			min_year = min(years)
 			extrap_years = list(range(min_year, MAX_EXTRAPOLATION_YEAR + 1))
 			df = pd.DataFrame(index=ages, columns=extrap_years, dtype=float)
@@ -310,7 +328,7 @@ def train_and_test(country, sex, num_layers=2, clip_gradient=False, do_extrapola
 				df[year] = extrap_output_data[:, i]
 			if FIT_LOGS:
 				df = np.exp(df)
-			df.to_csv(os.path.join(RESULTS, "predicted-" + basename))
+			df.to_csv(os.path.join(results_dir, "predicted-" + basename))
 			logging.info("Saved extrapolation results.")
 			if do_gradients:
 				extrap_input_years = years[-input_size:]
@@ -324,14 +342,14 @@ def train_and_test(country, sex, num_layers=2, clip_gradient=False, do_extrapola
 						extrap_gradient_data = sess.run(extrap_gradient, feed_dict={gradient_mask: gradient_mask_data})
 						assert extrap_gradient_data.shape == (num_ages, input_size)
 						df.loc[year] = extrap_gradient_data[age_idx, :]
-					df.to_csv(os.path.join(RESULTS, ("gradient-predicted-%d-" % age) + basename))
+					df.to_csv(os.path.join(results_dir, ("gradient-predicted-%d-" % age) + basename))
 				logging.info("Saved gradients.")
+		elif mode == "test":
+			test_loss_value, test_bias_value = sess.run([test_loss, test_bias])
+			logging.info("Test loss: %g, test bias: %g", test_loss_value, test_bias_value)
 		else:
-			logging.info("Lowest test loss %g after %i steps", lowest_test_loss, lowest_test_loss_step)
-			
-		trained_values = sess.run(trainable_variables)
-		return {variable.name : value for variable, value in zip(trainable_variables, trained_values)}
-			
+			logging.info("Lowest test loss %g after %i steps (corresponding test bias %g)", lowest_test_loss, lowest_test_loss_step, lowest_test_bias)		
+
 			
 def ensure_dir(directory):
     if not os.path.exists(directory):
@@ -339,13 +357,36 @@ def ensure_dir(directory):
 	
 	
 if __name__ == "__main__":
+	if len(sys.argv) <= 3:
+		print("Run as %s <country> <sex> <mode> [num reps=1]" % sys.argv[0])
+		sys.exit()
+	country = sys.argv[1]
+	sex = sys.argv[2]
+	mode = sys.argv[3]
+	
+	log_filename = 'extrapolation_%s_%s_%s.log' % (country, sex, mode)
+	print("Logging to %s" % log_filename)
+	logging.basicConfig(filename=log_filename,
+		level=logging.INFO,
+		format='%(asctime)s %(levelname)-8s %(message)s',
+		datefmt='%Y-%m-%d %H:%M:%S')
+	
+	# Optimised hyperparameters
+	input_size = 40
+	num_layers = 5
+	# Number of hidden layers = num_layers - 1
+	hidden_size = 64
+	num_reps = 1
+	
+	if len(sys.argv) > 4:
+		num_reps = int(sys.argv[4])
+		
 	clip_gradient = False
-	restore = True
-	num_layers = 4 # Excluding the input layer
+	restore = False
 	do_gradients = True
-	for directory in [RESULTS, CHECKPOINTS]:
-		ensure_dir(os.path.join(".", directory))
-	logging.info("Saving in directories %s and %s", RESULTS, CHECKPOINTS)
-	for do_extrapolation, country, sex in itertools.product([True], ["uk", "ew"], ["female", "male"]):
-		train_and_test(country, sex, num_layers=num_layers, clip_gradient=clip_gradient,
-				do_extrapolation=do_extrapolation, pretrained_values=None, restore=restore, do_gradients=do_gradients)
+	save_checkpoints = False
+	
+	for run_idx in range(num_reps):
+		run(mode, run_idx, country, sex, input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, 
+			clip_gradient=clip_gradient, restore=restore, do_gradients=do_gradients, save_checkpoints=save_checkpoints)
+		logging.info("--> FINISHED <--")
